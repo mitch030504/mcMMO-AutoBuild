@@ -5,8 +5,9 @@ on:
     - cron: '17 * * * *'
   workflow_dispatch:
 
+# Building upstream code does not require release/push credentials.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: mcmmo-upstream-release
@@ -17,17 +18,25 @@ env:
   UPSTREAM_BRANCH: master
 
 jobs:
-  build-release:
-    name: Build and publish upstream mcMMO
+  build:
+    name: Check upstream and build mcMMO
     runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.metadata.outputs.upstream_sha }}
+      short_sha: ${{ steps.metadata.outputs.short_sha }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      asset: ${{ steps.metadata.outputs.asset }}
+      released: ${{ steps.existing.outputs.released }}
 
     steps:
       - name: Checkout upstream mcMMO
         uses: actions/checkout@v4
         with:
-          repository: mcMMO-Dev/mcMMO
-          ref: master
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Read upstream metadata
         id: metadata
@@ -47,20 +56,24 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-      - name: Check whether this upstream commit is already released
+      - name: Check whether this build is already available
         id: existing
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.metadata.outputs.tag }}
+          ASSET: ${{ steps.metadata.outputs.asset }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -Fxq "$ASSET"; then
             echo "released=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream commit $TAG is already released; nothing to do."
+            echo "Release $TAG already contains $ASSET; nothing to build."
           else
             echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "Release or asset is missing for $TAG; building."
           fi
 
       - name: Set up Java 17
@@ -75,32 +88,91 @@ jobs:
         if: steps.existing.outputs.released != 'true'
         run: mvn -B -DskipTests clean package --file pom.xml
 
-      - name: Prepare release asset
+      - name: Upload compiled JAR to release job
         if: steps.existing.outputs.released != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-mcmmo-jar
+          path: target/mcMMO.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish verified upstream build
+    needs: build
+    if: needs.build.outputs.released != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout autobuild repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download compiled JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: upstream-mcmmo-jar
+          path: dist
+
+      - name: Prepare release asset
         env:
-          ASSET: ${{ steps.metadata.outputs.asset }}
+          ASSET: ${{ needs.build.outputs.asset }}
         shell: bash
         run: |
           set -euo pipefail
-          test -f target/mcMMO.jar
-          cp target/mcMMO.jar "$ASSET"
+          test -s dist/mcMMO.jar
+          cp dist/mcMMO.jar "$ASSET"
+          sha256sum "$ASSET" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish GitHub prerelease in this fork
-        if: steps.existing.outputs.released != 'true'
+      - name: Tag the actual upstream commit
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep the autobuild branch untouched. Fetch the commit we actually built,
+          # so the release's source archives and commit history match its JAR.
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git cat-file -e "${UPSTREAM_SHA}^{commit}"
+
+          # Retry safely if publishing previously failed after the tag was pushed.
+          REMOTE_SHA="$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')"
+          if [[ -n "$REMOTE_SHA" ]]; then
+            if [[ "$REMOTE_SHA" != "$UPSTREAM_SHA" ]]; then
+              echo "::error::Tag $TAG points to $REMOTE_SHA, not upstream $UPSTREAM_SHA. Refusing to overwrite it."
+              exit 1
+            fi
+            echo "Tag $TAG already points to the correct upstream commit."
+          else
+            git tag "$TAG" "$UPSTREAM_SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+
+      - name: Create or repair GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.metadata.outputs.tag }}
-          VERSION: ${{ steps.metadata.outputs.version }}
-          SHORT_SHA: ${{ steps.metadata.outputs.short_sha }}
-          UPSTREAM_SHA: ${{ steps.metadata.outputs.upstream_sha }}
-          ASSET: ${{ steps.metadata.outputs.asset }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.upstream_sha }}
+          ASSET: ${{ needs.build.outputs.asset }}
         shell: bash
         run: |
           set -euo pipefail
 
-          gh release create "$TAG" "$ASSET" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "mcMMO ${VERSION} upstream ${SHORT_SHA}" \
-            --notes "Automated build of mcMMO-Dev/mcMMO@${UPSTREAM_SHA} from the upstream master branch." \
-            --prerelease
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "mcMMO ${VERSION} upstream ${SHORT_SHA}" \
+              --notes "Automated development build of mcMMO-Dev/mcMMO@${UPSTREAM_SHA} from the upstream master branch." \
+              --prerelease
+          fi
