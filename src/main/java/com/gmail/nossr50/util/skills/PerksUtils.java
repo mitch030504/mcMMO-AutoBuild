@@ -37,7 +37,19 @@ public final class PerksUtils {
     private PerksUtils() {
     }
 
-    private static double resolveXpPerkModifier(Player player, PrimarySkillType skill) {
+    /**
+     * Returns the XP perk multiplier a player gets for a skill: the custom boost if they hold
+     * it, otherwise the strongest fixed tier they hold, otherwise 1.0.
+     *
+     * @param player the player to check
+     * @param skill the skill to check
+     * @return the XP perk multiplier
+     */
+    public static double getXpPerkMultiplier(Player player, PrimarySkillType skill) {
+        if (Permissions.customXpBoost(player, skill)) {
+            return ExperienceConfig.getInstance().getCustomXpPerkBoost();
+        }
+
         for (XpPerkTier tier : XP_PERK_TIERS) {
             if (tier.permissionCheck().test(player, skill)) {
                 return tier.modifier();
@@ -79,22 +91,15 @@ public final class PerksUtils {
     }
 
     public static float handleXpPerks(Player player, float xp, PrimarySkillType skill) {
-        double modifier = 1.0F;
-
         final McMMOPlayer mmoPlayer = UserManager.getPlayer(player);
         final boolean debugMode = mmoPlayer != null && mmoPlayer.isDebugMode();
 
-        if (Permissions.customXpBoost(player, skill)) {
-            if (debugMode) {
-                player.sendMessage(ChatColor.GOLD + "[DEBUG] " + ChatColor.DARK_GRAY
-                        + "XP Perk Multiplier IS CUSTOM! ");
-            }
-
-            modifier = ExperienceConfig.getInstance().getCustomXpPerkBoost();
-        } else {
-            modifier = resolveXpPerkModifier(player, skill);
+        if (debugMode && Permissions.customXpBoost(player, skill)) {
+            player.sendMessage(ChatColor.GOLD + "[DEBUG] " + ChatColor.DARK_GRAY
+                    + "XP Perk Multiplier IS CUSTOM! ");
         }
 
+        final double modifier = getXpPerkMultiplier(player, skill);
         float modifiedXP = (float) (xp * modifier);
 
         if (debugMode) {
